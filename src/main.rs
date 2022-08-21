@@ -224,7 +224,7 @@ async fn main() {
 
     Swarm::listen_on(
         &mut swarm,
-        "/ip4/127.0.0.1/tcp/0"
+        "/ip4/0.0.0.0/tcp/0"
             .parse()
             .expect("can get a local socket"),
     )
@@ -244,8 +244,8 @@ async fn main() {
                 response = response_receiver.recv() => {
                     Some(EventType::Response(response.expect("response exists")))
                 },
-                _event = swarm.select_next_some() => {
-                    // info!("Swarm Event: {:?}", event);
+                event = swarm.select_next_some() => {
+                    info!("Unhandled Swarm Event: {:?}", event);
                     None
                 },
             }
@@ -291,10 +291,6 @@ async fn handle_list_peers(swarm: &mut Swarm<LogBehaviour>) {
 
 async fn handle_list_logs(cmd: &str, swarm: &mut Swarm<LogBehaviour>) {
     let rest = cmd.strip_prefix("list logs ");
-
-    // if let Some(content) = rest {
-    //     if content.is_empty() {rest = None}
-    // }
 
     match rest {
         Some("all") => {
