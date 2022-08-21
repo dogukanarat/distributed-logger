@@ -1,4 +1,3 @@
-
 use libp2p::{
     core::upgrade,
     floodsub::{Floodsub, Topic},
@@ -74,7 +73,8 @@ async fn main()
     {
         let event = {
             tokio::select! {
-                line = stdin.next_line() => {
+                line = stdin.next_line() => 
+                {
                     Some(
                         EventType::Input(
                             line.expect("can get line")
@@ -82,10 +82,16 @@ async fn main()
                         )
                     )
                 },
-                response = response_receiver.recv() => {
-                    Some(EventType::Response(response.expect("response exists")))
+                response = response_receiver.recv() => 
+                {
+                    Some(
+                        EventType::Response(
+                            response.expect("response exists")
+                        )
+                    )
                 },
-                event = swarm.select_next_some() => {
+                event = swarm.select_next_some() => 
+                {
                     info!("Unhandled Swarm Event: {:?}", event);
                     None
                 },
