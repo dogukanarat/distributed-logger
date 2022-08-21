@@ -1,229 +1,41 @@
-use chrono::offset::Utc;
-use chrono::DateTime;
+
 use libp2p::{
     core::upgrade,
-    floodsub::{Floodsub, FloodsubEvent, Topic},
+    floodsub::{Floodsub, Topic},
     futures::StreamExt,
-    identity,
-    mdns::{Mdns, MdnsEvent},
+    mdns::{Mdns},
     mplex,
     noise::{Keypair, NoiseConfig, X25519Spec},
-    swarm::{NetworkBehaviourEventProcess, Swarm, SwarmBuilder},
+    swarm::{Swarm, SwarmBuilder},
     tcp::TokioTcpConfig,
-    NetworkBehaviour, PeerId, Transport,
+    Transport,
 };
 use log::{error, info};
 use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::time::SystemTime;
-use tokio::{fs, io::AsyncBufReadExt, sync::mpsc};
+use tokio::{io::AsyncBufReadExt, sync::mpsc};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
+mod protocol;
 
-const STORAGE_FILE_PATH: &str = "./log-file.json";
+use protocol::{
+    common::{ListMode, ListRequest, EventType},
+    behaviour::{LogBehaviour},
+    helper, behaviour
+};
 
-static KEYS: Lazy<identity::Keypair> = Lazy::new(|| identity::Keypair::generate_ed25519());
-static PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(KEYS.public()));
 static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("logging"));
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Log
-{
-    timestamp: String,
-    content: String,
-}
-
-type Logs = Vec<Log>;
-
-#[derive(Debug, Serialize, Deserialize)]
-enum ListMode
-{
-    All,
-    One(String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ListRequest
-{
-    mode: ListMode,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ListResponse
-{
-    mode: ListMode,
-    data: Logs,
-    receiver: String,
-}
-
-enum EventType
-{
-    Response(ListResponse),
-    Input(String),
-}
-
-#[derive(NetworkBehaviour)]
-struct LogBehaviour
-{
-    floodsub: Floodsub,
-    mdns: Mdns,
-    #[behaviour(ignore)]
-    response_sender: mpsc::UnboundedSender<ListResponse>,
-}
-
-impl NetworkBehaviourEventProcess<FloodsubEvent> for LogBehaviour
-{
-    fn inject_event(&mut self, event: FloodsubEvent)
-    {
-        match event
-        {
-            FloodsubEvent::Message(message) =>
-            {
-                if let Ok(response) = serde_json::from_slice::<ListResponse>(&message.data)
-                {
-                    if response.receiver == PEER_ID.to_string()
-                    {
-                        info!("Response From {}:", message.source);
-                        response.data.iter().for_each(|log| info!("{:?}", log));
-                    }
-                    return;
-                }
-                if let Ok(request) = serde_json::from_slice::<ListRequest>(&message.data)
-                {
-                    match request.mode
-                    {
-                        ListMode::All =>
-                        {
-                            info!(
-                                "Received All Request: {:?} From {:?}",
-                                request, message.source
-                            );
-                            respond_with_logs(
-                                self.response_sender.clone(),
-                                message.source.to_string(),
-                            );
-                        }
-                        ListMode::One(ref peer_id) =>
-                        {
-                            if peer_id == &PEER_ID.to_string()
-                            {
-                                info!("Received Request: {:?} From {:?}", request, message.source);
-                                respond_with_logs(
-                                    self.response_sender.clone(),
-                                    message.source.to_string(),
-                                );
-                            }
-                        }
-                    }
-                    return;
-                }
-            }
-            _ => (),
-        }
-    }
-}
-
-impl NetworkBehaviourEventProcess<MdnsEvent> for LogBehaviour
-{
-    fn inject_event(&mut self, event: MdnsEvent)
-    {
-        match event
-        {
-            MdnsEvent::Discovered(discovered_list) =>
-            {
-                for (peer, _addr) in discovered_list
-                {
-                    self.floodsub.add_node_to_partial_view(peer);
-                }
-            }
-            MdnsEvent::Expired(expired_list) =>
-            {
-                for (peer, _addr) in expired_list
-                {
-                    if !self.mdns.has_node(&peer)
-                    {
-                        self.floodsub.remove_node_from_partial_view(&peer);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn respond_with_logs(sender: mpsc::UnboundedSender<ListResponse>, receiver: String)
-{
-    tokio::spawn(async move {
-        match read_local_logs().await
-        {
-            Ok(logs) =>
-            {
-                let response = ListResponse {
-                    mode: ListMode::All,
-                    receiver,
-                    data: logs.into_iter().collect(),
-                };
-
-                if let Err(error) = sender.send(response)
-                {
-                    error!("error sending response via channel, {}", error);
-                }
-            }
-            Err(error) =>
-            {
-                error!(
-                    "error fetching local recipes to answer all request, {}",
-                    error
-                )
-            }
-        }
-    });
-}
-
-async fn create_new_log(content: &str) -> Result<()>
-{
-    let mut local_logs = read_local_logs().await?;
-    let current_timestamp: DateTime<Utc> = SystemTime::now().into();
-
-    local_logs.push(Log {
-        timestamp: format!("{}", current_timestamp.format("%d/%m/%Y %T")),
-        content: content.to_owned(),
-    });
-
-    write_local_logs(&local_logs).await?;
-
-    info!("Created Log:");
-    info!("Timestamp: {}", local_logs.last().unwrap().timestamp);
-    info!("Content: {}", local_logs.last().unwrap().content);
-
-    Ok(())
-}
-
-async fn read_local_logs() -> Result<Logs>
-{
-    let content = fs::read(STORAGE_FILE_PATH).await?;
-    let result = serde_json::from_slice(&content)?;
-    Ok(result)
-}
-
-async fn write_local_logs(logs: &Logs) -> Result<()>
-{
-    let json = serde_json::to_string(&logs)?;
-    fs::write(STORAGE_FILE_PATH, &json).await?;
-    Ok(())
-}
 
 #[tokio::main]
 async fn main()
 {
     pretty_env_logger::init();
 
-    info!("Peer Id: {}", PEER_ID.clone());
+    info!("Peer Id: {}", behaviour::get_peed_id());
 
     let (response_sender, mut response_receiver) = mpsc::unbounded_channel();
 
     let auth_keys = Keypair::<X25519Spec>::new()
-        .into_authentic(&KEYS)
+        .into_authentic(behaviour::get_keys_ref())
         .expect("can create auth keys");
 
     let transport = TokioTcpConfig::new()
@@ -233,7 +45,7 @@ async fn main()
         .boxed();
 
     let mut behaviour = LogBehaviour {
-        floodsub: Floodsub::new(PEER_ID.clone()),
+        floodsub: Floodsub::new(behaviour::get_peed_id()),
         mdns: Mdns::new(Default::default())
             .await
             .expect("can create mdns"),
@@ -242,7 +54,7 @@ async fn main()
 
     behaviour.floodsub.subscribe(TOPIC.clone());
 
-    let mut swarm = SwarmBuilder::new(transport, behaviour, PEER_ID.clone())
+    let mut swarm = SwarmBuilder::new(transport, behaviour, behaviour::get_peed_id())
         .executor(Box::new(|future| {
             tokio::spawn(future);
         }))
@@ -355,11 +167,11 @@ async fn handle_list_logs(cmd: &str, swarm: &mut Swarm<LogBehaviour>)
         }
         None =>
         {
-            match read_local_logs().await
+            match helper::get_local_logs().await
             {
                 Ok(vector) =>
                 {
-                    info!("Local Recipes ({})", vector.len());
+                    info!("Local Logs ({})", vector.len());
                     vector.iter().for_each(|log| info!("{:?}", log));
                 }
                 Err(error) => error!("error fetching local recipes: {}", error),
@@ -372,7 +184,7 @@ async fn handle_create_log(cmd: &str)
 {
     if let Some(content) = cmd.strip_prefix("create log -- ")
     {
-        if let Err(error) = create_new_log(content).await
+        if let Err(error) = helper::create_new_log(content).await
         {
             error!("error creating log: {}", error);
         };
